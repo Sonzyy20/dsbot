@@ -142,7 +142,7 @@ async function checkId(id) {
     });
     const data = response.data;
     
-    if (data.status === 'ok' && data.data && data.data !== false) {
+    if (data.status === 'o' && data.data && data.data !== false) {
       // Фильтруем только товары в наличии (in_stock >= 1)
       const inStock = data.data.in_stock || 0;
       if (inStock >= 1) {
