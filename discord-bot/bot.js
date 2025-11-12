@@ -20,7 +20,8 @@ const client = new Client({
 });
 
 // ВСТАВЬ СЮДА НОВЫЙ ТОКЕН
-const TOKEN = "MTQzNzA2MTg5NDIxNjIyMDcyMg.G4FusY._z7gndI4R2zRSt6EUDhCvWPlT1b3MsfMevzcBg";
+require('dotenv').config();
+const TOKEN = process.env.DISCROD_API;
 
 const PREFIX = '!';
 const DATA_FILE = path.join(__dirname, 'marketplace_data.json');
