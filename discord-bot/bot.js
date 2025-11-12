@@ -116,23 +116,165 @@ async function checkId(id) {
 
 // -------- Загрузка с API --------
 
-async function fetchMarketData(limit = 100000) {
-  try {
-    const response = await axios.get('https://api.uexcorp.space/2.0/items', {
-      params: { limit },
-      timeout: 30000
-    });
-    
-    if (response.data && response.data.data) {
-      marketCache = response.data.data;
-      await saveLocalData();
-      return marketCache.length;
-    }
-    return 0;
-  } catch (error) {
-    console.error('Ошибка загрузки:', error.message);
-    throw error;
+async function fetchMarketData(startId = 2000, endId = 100000, batchSize = 2000) {
+  console.log(`\n📋 === RELOAD: Начало полной загрузки ===`);
+  console.log(`🔢 Диапазон ID: ${startId} - ${endId}`);
+  console.log(`📦 Размер батча: ${batchSize}`);
+  console.log(`⏰ Примерное время: ~${Math.ceil((endId - startId) / batchSize * 0.5)} минут\n`);
+
+  marketCache = [];
+  let totalFound = 0;
+  let totalChecked = 0;
+  let batchNumber = 1;
+  const totalBatches = Math.ceil((endId - startId) / batchSize);
+
+  // Очищаем временный файл
+  if (fsSync.existsSync(TEMP_FILE)) {
+    await fs.unlink(TEMP_FILE);
   }
+
+  for (let batchStart = startId; batchStart <= endId; batchStart += batchSize) {
+    const batchEnd = Math.min(batchStart + batchSize - 1, endId);
+    let foundInBatch = 0;
+
+    console.log(`\n[Батч ${batchNumber}/${totalBatches}] 🔍 Проверяю диапазон ${batchStart} - ${batchEnd}`);
+
+    for (let id = batchStart; id <= batchEnd; id++) {
+      const result = await checkId(id);
+      
+      if (result.exists) {
+        const item = result.data;
+        const inStock = item.in_stock || 0;
+        const isSoldOut = item.is_sold_out || 0;
+
+        // Добавляем только если товар в наличии и не распродан
+        if (inStock >= 1 && isSoldOut === 0) {
+          appendToTempFile({ id, ...item });
+          foundInBatch++;
+          totalFound++;
+          
+          const itemName = item.title || item.name || item.slug || `ID:${id}`;
+          console.log(`   ✅ Найден: ${itemName} (${inStock} шт)`);
+        } else {
+          console.log(`   ⚠️  ID ${id} пропущен (out of stock или sold out)`);
+        }
+      }
+      
+      totalChecked++;
+      
+      // Небольшая пауза между запросами
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+
+    console.log(`\n📊 Батч ${batchNumber} завершен: найдено ${foundInBatch} товаров`);
+    console.log(`📈 Общий прогресс: ${totalFound} товаров из ${totalChecked} проверенных ID\n`);
+
+    batchNumber++;
+    
+    // Пауза между батчами
+    await new Promise(resolve => setTimeout(resolve, 1000));
+  }
+
+  // Конвертируем временный файл в финальный
+  console.log(`\n💾 Сохраняю данные в ${DATA_FILE}...`);
+  
+  try {
+    const content = await fs.readFile(TEMP_FILE, 'utf8');
+    const lines = content.trim().split('\n').filter(line => line);
+    const allItems = lines.map(line => JSON.parse(line));
+
+    // Удаляем дубликаты
+    const uniqueItems = {};
+    for (const item of allItems) {
+      if (item.id && (item.in_stock || 0) >= 1 && (item.is_sold_out || 0) === 0) {
+        uniqueItems[item.id] = item;
+      }
+    }
+
+    marketCache = Object.values(uniqueItems);
+    await saveLocalData();
+    
+    // Удаляем временный файл
+    await fs.unlink(TEMP_FILE);
+    
+    console.log(`✅ Данные сохранены: ${marketCache.length} уникальных записей`);
+  } catch (err) {
+    console.error('❌ Ошибка при сохранении:', err.message);
+  }
+
+  console.log(`\n✅ === RELOAD: Завершено ===`);
+  console.log(`🔍 Всего проверено ID: ${totalChecked}`);
+  console.log(`📦 Найдено товаров: ${totalFound}`);
+  console.log(`💾 Сохранено уникальных: ${marketCache.length}\n`);
+
+  return marketCache.length;
+}
+
+// -------- Обновление старых записей --------
+
+async function updateOldListings() {
+  const itemsToUpdate = marketCache.filter(item => (item.in_stock || 0) < 10 && (item.in_stock || 0) > 0);
+  let updated = 0;
+  let removed = 0;
+  let checked = 0;
+
+  console.log(`\n📋 === OLDUPDATE: Начало обновления ===`);
+  console.log(`📦 Найдено товаров для проверки: ${itemsToUpdate.length}`);
+  console.log(`⏰ Примерное время: ~${Math.ceil(itemsToUpdate.length * 0.15 / 60)} минут\n`);
+
+  for (const item of itemsToUpdate) {
+    if (!item.id) continue;
+    
+    checked++;
+    const itemName = item.title || item.name || item.slug || `ID:${item.id}`;
+    const oldStock = item.in_stock || 0;
+    
+    console.log(`[${checked}/${itemsToUpdate.length}] 🔍 Проверяю: ${itemName} (было: ${oldStock} шт)`);
+    
+    const result = await checkId(item.id);
+    
+    if (result.exists) {
+      // Обновляем данные напрямую в marketCache
+      const index = marketCache.findIndex(i => i.id === item.id);
+      if (index !== -1) {
+        const newStock = result.data.in_stock || 0;
+        marketCache[index] = { ...result.data };
+        updated++;
+        
+        if (newStock !== oldStock) {
+          console.log(`   ✅ Обновлено: ${oldStock} → ${newStock} шт`);
+        } else {
+          console.log(`   ℹ️  Без изменений`);
+        }
+        
+        // Сохраняем после каждого обновления
+        await saveLocalData();
+      }
+    } else {
+      // Удаляем если товар больше не доступен
+      marketCache = marketCache.filter(i => i.id !== item.id);
+      removed++;
+      console.log(`   ❌ Удалено (распродано или недоступно)`);
+      
+      // Сохраняем после каждого удаления
+      await saveLocalData();
+    }
+    
+    // Прогресс каждые 10 записей
+    if (checked % 10 === 0) {
+      console.log(`\n📊 Прогресс: ${checked}/${itemsToUpdate.length} | Обновлено: ${updated} | Удалено: ${removed}\n`);
+    }
+    
+    await new Promise(resolve => setTimeout(resolve, 150));
+  }
+  
+  console.log(`\n✅ === OLDUPDATE: Завершено ===`);
+  console.log(`📝 Проверено: ${itemsToUpdate.length}`);
+  console.log(`🔄 Обновлено: ${updated}`);
+  console.log(`🗑️  Удалено: ${removed}`);
+  console.log(`💾 Все изменения сохранены в ${DATA_FILE}\n`);
+  
+  return { total: itemsToUpdate.length, updated, removed };
 }
 
 // -------- Discord Bot --------
@@ -151,7 +293,7 @@ function getPrice(item) {
   return null;
 }
 
-function buildPageEmbeds(results, page, totalPages) {
+function buildPageEmbeds(results, page, totalPages, listingType = 'sell') {
   const ITEMS_PER_PAGE = 5;
   const start = page * ITEMS_PER_PAGE;
   const slice = results.slice(start, start + ITEMS_PER_PAGE);
@@ -161,6 +303,10 @@ function buildPageEmbeds(results, page, totalPages) {
     const stock = item.in_stock || 0;
     const seller = item.user_name || 'Unknown';
     const url = item.slug ? `https://uexcorp.space/marketplace/item/info/${item.slug}` : null;
+    
+    // Определяем тип объявления
+    const isBuyListing = item.listing_type === 'buy' || item.type === 'buy';
+    const listingLabel = isBuyListing ? '🔵 WTB (Покупка)' : '🟢 WTS (Продажа)';
 
     const color = stock >= 5 ? "#00FF00" : stock >= 2 ? "#F1C40F" : "#FF0000";
 
@@ -170,9 +316,10 @@ function buildPageEmbeds(results, page, totalPages) {
       .setThumbnail(item.user_avatar || null)
       .setURL(url)
       .setDescription(
+        `${listingLabel}\n` +
         `💰 **Цена:** ${price?.toLocaleString()} aUEC\n` +
         `📦 **В наличии:** ${stock}\n` +
-        `👤 Продавец: **${seller}**`
+        `👤 ${isBuyListing ? 'Покупатель' : 'Продавец'}: **${seller}**`
       )
       .setFooter({ text: `Страница ${page + 1} из ${totalPages}` })
       .setTimestamp();
@@ -184,6 +331,14 @@ function pageButtons() {
     new ButtonBuilder().setCustomId('prev').setLabel('⬅ Назад').setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId('next').setLabel('Вперед ➡').setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId('close').setLabel('Закрыть').setStyle(ButtonStyle.Danger)
+  );
+}
+
+function filterButtons() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('filter_all').setLabel('Все').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('filter_sell').setLabel('WTS (Продажа)').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId('filter_buy').setLabel('WTB (Покупка)').setStyle(ButtonStyle.Primary)
   );
 }
 
@@ -210,9 +365,11 @@ client.on('messageCreate', async message => {
         },
         {
           name: '🔄 !reload',
-          value: 'Обновить базу данных с API UEX Corp.\n' +
-                 '• Загружает до 100,000 позиций\n' +
-                 '• Может занять несколько секунд\n' +
+          value: 'Полная перезагрузка базы данных.\n' +
+                 '• Проверяет ID от 2000 до 100,000\n' +
+                 '• Добавляет только товары в наличии\n' +
+                 '• Пропускает распроданные позиции\n' +
+                 '• Может занять продолжительное время\n' +
                  '• Доступно только администраторам'
         },
         {
@@ -221,6 +378,13 @@ client.on('messageCreate', async message => {
                  '• Проверяет ID после последнего (до +30,000)\n' +
                  '• Делает это порциями по 2000\n' +
                  '• Сохраняет только товары в наличии\n' +
+                 '• Доступно только администраторам'
+        },
+        {
+          name: '🔄 !oldupdate',
+          value: 'Обновить информацию о товарах с наличием < 10 шт.\n' +
+                 '• Проверяет актуальность данных\n' +
+                 '• Удаляет распроданные позиции\n' +
                  '• Доступно только администраторам'
         },
         {
@@ -254,12 +418,25 @@ client.on('messageCreate', async message => {
       return message.reply('❌ Только администраторы могут обновлять базу.');
     }
 
-    const loading = await message.reply('🔄 Загружаю данные с API (лимит: 100,000)...');
+    const loading = await message.reply('🔄 Начинаю полную перезагрузку базы данных...\n📋 Проверка ID: 2000-100000 (это займет время)');
     
     try {
-      const count = await fetchMarketData(100000);
-      await loading.edit(`✅ Загружено **${count.toLocaleString()}** позиций!`);
+      const count = await fetchMarketData(2000, 100000, 2000);
+      
+      const reloadEmbed = new EmbedBuilder()
+        .setColor('#00ff00')
+        .setTitle('✅ Полная перезагрузка завершена')
+        .addFields(
+          { name: 'Диапазон ID', value: '2000 - 100000', inline: true },
+          { name: 'Загружено позиций', value: count.toLocaleString(), inline: true },
+          { name: 'Фильтр', value: 'Только товары в наличии', inline: true }
+        )
+        .setFooter({ text: 'Подробности в консоли сервера' })
+        .setTimestamp();
+      
+      await loading.edit({ content: null, embeds: [reloadEmbed] });
     } catch (error) {
+      console.error('❌ Ошибка в reload:', error);
       await loading.edit(`❌ Ошибка загрузки: ${error.message}`);
     }
     return;
@@ -329,6 +506,41 @@ client.on('messageCreate', async message => {
     return msg.edit({ content: null, embeds: [updateEmbed] });
   }
 
+  // ---- OLDUPDATE ----
+  if (command === 'oldupdate') {
+    if (!message.member.permissions.has('Administrator')) {
+      return message.reply('❌ Только администраторы могут обновлять базу.');
+    }
+
+    if (!marketCache.length) {
+      return message.reply('⚠️ База данных пуста. Используйте `!reload` перед `!oldupdate`.');
+    }
+
+    const itemsCount = marketCache.filter(item => (item.in_stock || 0) < 10 && (item.in_stock || 0) > 0).length;
+    const msg = await message.reply(`🔄 Начинаю обновление товаров с наличием < 10 шт...\n📦 Найдено: ${itemsCount} позиций для проверки`);
+    
+    try {
+      const result = await updateOldListings();
+      
+      const oldUpdateEmbed = new EmbedBuilder()
+        .setColor('#00ff00')
+        .setTitle('✅ Обновление старых записей завершено')
+        .addFields(
+          { name: 'Проверено записей', value: result.total.toString(), inline: true },
+          { name: 'Обновлено', value: result.updated.toString(), inline: true },
+          { name: 'Удалено (распродано)', value: result.removed.toString(), inline: true },
+          { name: 'Всего в базе', value: marketCache.length.toString(), inline: false }
+        )
+        .setFooter({ text: 'Подробности в консоли сервера' })
+        .setTimestamp();
+      
+      return msg.edit({ content: null, embeds: [oldUpdateEmbed] });
+    } catch (error) {
+      console.error('❌ Ошибка в oldupdate:', error);
+      return msg.edit(`❌ Ошибка обновления: ${error.message}`);
+    }
+  }
+
   // ---- DEDUPE ----
   if (command === 'dedupe') {
     if (!message.member.permissions.has('Administrator')) {
@@ -396,7 +608,7 @@ client.on('messageCreate', async message => {
     const query = args.join(' ').toLowerCase();
     const loading = await message.reply('🔍 Ищу...');
 
-    let results = marketCache.filter(item =>
+    let allResults = marketCache.filter(item =>
       (item?.title?.toLowerCase().includes(query) ||
        item?.name?.toLowerCase().includes(query) ||
        item?.slug?.toLowerCase().includes(query))
@@ -405,29 +617,85 @@ client.on('messageCreate', async message => {
       && getPrice(item) !== null
     ).sort((a, b) => getPrice(a) - getPrice(b));
 
-    if (!results.length) return loading.edit('❌ Ничего не найдено. Попробуйте другой запрос.');
+    if (!allResults.length) return loading.edit('❌ Ничего не найдено. Попробуйте другой запрос.');
 
+    let currentFilter = 'all'; // 'all', 'sell', 'buy'
     let page = 0;
-    const totalPages = Math.ceil(results.length / 5);
 
-    let embeds = buildPageEmbeds(results, page, totalPages);
-    let msg = await loading.edit({ 
-      content: `Найдено: **${results.length}** ${results.length === 1 ? 'товар' : 'товаров'}`, 
-      embeds, 
-      components: [pageButtons()] 
-    });
+    function getFilteredResults() {
+      if (currentFilter === 'sell') {
+        return allResults.filter(item => {
+          const isBuy = item.listing_type === 'buy' || item.type === 'buy';
+          return !isBuy;
+        });
+      } else if (currentFilter === 'buy') {
+        return allResults.filter(item => {
+          const isBuy = item.listing_type === 'buy' || item.type === 'buy';
+          return isBuy;
+        });
+      }
+      return allResults;
+    }
+
+    function updateMessage() {
+      const results = getFilteredResults();
+      const totalPages = Math.ceil(results.length / 5);
+      
+      if (page >= totalPages) page = Math.max(0, totalPages - 1);
+      
+      const embeds = buildPageEmbeds(results, page, totalPages, currentFilter);
+      
+      const sellCount = allResults.filter(i => {
+        const isBuy = i.listing_type === 'buy' || i.type === 'buy';
+        return !isBuy;
+      }).length;
+      const buyCount = allResults.filter(i => {
+        const isBuy = i.listing_type === 'buy' || i.type === 'buy';
+        return isBuy;
+      }).length;
+      
+      let filterText = '';
+      if (currentFilter === 'all') filterText = 'Все';
+      else if (currentFilter === 'sell') filterText = 'WTS (Продажа)';
+      else if (currentFilter === 'buy') filterText = 'WTB (Покупка)';
+      
+      return {
+        content: `Найдено: **${allResults.length}** (🟢 WTS: ${sellCount} | 🔵 WTB: ${buyCount})\nФильтр: **${filterText}** | Показано: **${results.length}**`,
+        embeds,
+        components: [filterButtons(), pageButtons()]
+      };
+    }
+
+    let msg = await loading.edit(updateMessage());
 
     const collector = msg.createMessageComponentCollector({ time: 300000 });
 
     collector.on('collect', async i => {
-      if (i.user.id !== message.author.id) return i.reply({ content: "❌ Не тебе.", ephemeral: true });
+      if (i.user.id !== message.author.id) {
+        return i.reply({ content: "❌ Эти кнопки не для вас.", ephemeral: true });
+      }
 
+      // Фильтры
+      if (i.customId === 'filter_all') {
+        currentFilter = 'all';
+        page = 0;
+      } else if (i.customId === 'filter_sell') {
+        currentFilter = 'sell';
+        page = 0;
+      } else if (i.customId === 'filter_buy') {
+        currentFilter = 'buy';
+        page = 0;
+      }
+      
+      // Навигация
+      const results = getFilteredResults();
+      const totalPages = Math.ceil(results.length / 5);
+      
       if (i.customId === 'next') page = Math.min(page + 1, totalPages - 1);
       if (i.customId === 'prev') page = Math.max(page - 1, 0);
       if (i.customId === 'close') return i.message.delete().catch(() => {});
 
-      embeds = buildPageEmbeds(results, page, totalPages);
-      await i.update({ embeds, components: [pageButtons()] });
+      await i.update(updateMessage());
     });
 
     collector.on('end', () => {
