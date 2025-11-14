@@ -515,6 +515,7 @@ client.on('messageCreate', async message => {
   }
 
   // ---- UPDATE ----
+// ---- UPDATE ----
   if (command === 'update') {
     if (!message.member.permissions.has('Administrator')) {
       return message.reply('❌ Только администраторы могут обновлять базу.');
@@ -524,52 +525,131 @@ client.on('messageCreate', async message => {
       return message.reply('⚠️ База данных пуста. Используйте `!reload` перед `!update`.');
     }
 
-    const msg = await message.reply('🔄 Начинаю инкрементальное обновление...\n⚡ Ограничение: 10 запросов/сек');
     const maxId = Math.max(...marketCache.map(i => i.id || 0));
     const startId = maxId + 1;
     const endId = maxId + 30000;
     const BATCH_SIZE = 2000;
+    const totalBatches = Math.ceil((endId - startId + 1) / BATCH_SIZE);
+    
+    const msg = await message.reply(
+      `🔄 **Начинаю инкрементальное обновление**\n` +
+      `📊 Диапазон: ${startId} - ${endId} (${(endId - startId + 1).toLocaleString()} ID)\n` +
+      `📦 Батчей: ${totalBatches} по ${BATCH_SIZE} ID\n` +
+      `⚡ Ограничение: 10 запросов/сек\n` +
+      `⏰ Примерное время: ~${Math.ceil((endId - startId + 1) / 10 / 60)} минут`
+    );
+    
     let totalFound = 0;
     let totalChecked = 0;
     let batchNumber = 1;
+    const startTime = Date.now();
+
+    console.log(`\n📋 === UPDATE: Начало инкрементального обновления ===`);
+    console.log(`🔢 Диапазон ID: ${startId} - ${endId}`);
+    console.log(`📦 Размер батча: ${BATCH_SIZE}`);
+    console.log(`⚡ Ограничение: 10 запросов/сек\n`);
 
     for (let batchStart = startId; batchStart <= endId; batchStart += BATCH_SIZE) {
       const batchEnd = Math.min(batchStart + BATCH_SIZE - 1, endId);
+      const batchStartTime = Date.now();
+      
+      console.log(`\n[Батч ${batchNumber}/${totalBatches}] 🔍 Проверяю диапазон ${batchStart}-${batchEnd}`);
       
       if (fsSync.existsSync(TEMP_FILE)) {
         await fs.unlink(TEMP_FILE);
       }
       
       let foundInBatch = 0;
+      let wtsCount = 0;
+      let wtbCount = 0;
 
       for (let id = batchStart; id <= batchEnd; id++) {
         const result = await checkId(id);
         if (result.exists) {
+          const isBuy = isBuyListing(result.data);
           appendToTempFile({ id, ...result.data });
           foundInBatch++;
+          
+          if (isBuy) {
+            wtbCount++;
+          } else {
+            wtsCount++;
+          }
+          
+          const itemType = isBuy ? '🔵 WTB' : '🟢 WTS';
+          const itemName = result.data.title || result.data.name || result.data.slug || 'Без названия';
+          const stockInfo = isBuy ? 'Заказ' : `${result.data.in_stock} шт`;
+          console.log(`   ✅ [${id}] ${itemType} ${itemName} (${stockInfo})`);
         }
         totalChecked++;
+        
+        // Промежуточный вывод каждые 500 ID
+        if (totalChecked % 500 === 0) {
+          const progress = ((totalChecked / (endId - startId + 1)) * 100).toFixed(1);
+          const elapsed = Math.floor((Date.now() - startTime) / 1000);
+          console.log(`⏱️  Прогресс: ${totalChecked}/${endId - startId + 1} (${progress}%) | Найдено: ${totalFound} | Время: ${elapsed}s`);
+        }
       }
 
       if (foundInBatch > 0) {
         await mergeNewDataToMainFile();
+        await loadLocalData();
         totalFound += foundInBatch;
       }
 
-      await msg.edit(`✅ Блок ${batchNumber}: найдено ${foundInBatch}, всего найдено: ${totalFound}`);
+      const batchTime = Math.floor((Date.now() - batchStartTime) / 1000);
+      const totalTime = Math.floor((Date.now() - startTime) / 1000);
+      const progress = ((batchNumber / totalBatches) * 100).toFixed(1);
+      
+      console.log(`📊 Батч ${batchNumber} завершен за ${batchTime}s: найдено ${foundInBatch} (🟢 ${wtsCount} | 🔵 ${wtbCount})`);
+      console.log(`💾 Всего в базе: ${marketCache.length} | Общее время: ${totalTime}s\n`);
+
+      // Обновление сообщения в Discord с подробной статистикой
+      const progressBar = '█'.repeat(Math.floor(progress / 5)) + '░'.repeat(20 - Math.floor(progress / 5));
+      const estimatedTotal = Math.ceil(totalTime / batchNumber * totalBatches);
+      const estimatedRemaining = Math.max(0, estimatedTotal - totalTime);
+      
+      await msg.edit(
+        `🔄 **Инкрементальное обновление**\n\n` +
+        `**Прогресс батчей:** ${batchNumber}/${totalBatches} (${progress}%)\n` +
+        `${progressBar}\n\n` +
+        `📊 **Статистика батча ${batchNumber}:**\n` +
+        `• Диапазон: ${batchStart}-${batchEnd}\n` +
+        `• Найдено: ${foundInBatch} (🟢 WTS: ${wtsCount} | 🔵 WTB: ${wtbCount})\n` +
+        `• Время: ${batchTime}s\n\n` +
+        `📈 **Общая статистика:**\n` +
+        `• Проверено ID: ${totalChecked.toLocaleString()} / ${(endId - startId + 1).toLocaleString()}\n` +
+        `• Найдено всего: ${totalFound}\n` +
+        `• В базе: ${marketCache.length.toLocaleString()}\n` +
+        `• Прошло времени: ${Math.floor(totalTime / 60)}м ${totalTime % 60}s\n` +
+        `• Осталось: ~${Math.floor(estimatedRemaining / 60)}м ${estimatedRemaining % 60}s`
+      );
+      
       batchNumber++;
     }
 
     await loadLocalData();
     
+    const totalTime = Math.floor((Date.now() - startTime) / 1000);
+    
+    console.log(`\n✅ === UPDATE: Завершено ===`);
+    console.log(`🔍 Проверено ID: ${totalChecked}`);
+    console.log(`📦 Найдено товаров: ${totalFound}`);
+    console.log(`💾 Всего в базе: ${marketCache.length}`);
+    console.log(`⏱️  Общее время: ${Math.floor(totalTime / 60)}м ${totalTime % 60}s\n`);
+    
     const updateEmbed = new EmbedBuilder()
       .setColor('#00ff00')
-      .setTitle('✅ Обновление завершено')
+      .setTitle('✅ Инкрементальное обновление завершено')
       .addFields(
-        { name: 'Проверено ID', value: `${startId} - ${endId} (${totalChecked} ID)`, inline: false },
-        { name: 'Найдено новых', value: totalFound.toString(), inline: true },
-        { name: 'Всего в базе', value: marketCache.length.toString(), inline: true }
+        { name: '📊 Проверено ID', value: `${startId} - ${endId}\n(${totalChecked.toLocaleString()} ID)`, inline: true },
+        { name: '📦 Найдено новых', value: totalFound.toString(), inline: true },
+        { name: '💾 Всего в базе', value: marketCache.length.toLocaleString(), inline: true },
+        { name: '⏱️ Время выполнения', value: `${Math.floor(totalTime / 60)}м ${totalTime % 60}s`, inline: true },
+        { name: '⚡ Скорость', value: `${(totalChecked / totalTime).toFixed(1)} ID/сек`, inline: true },
+        { name: '📈 Эффективность', value: `${((totalFound / totalChecked) * 100).toFixed(2)}%`, inline: true }
       )
+      .setFooter({ text: 'Подробности в консоли сервера' })
       .setTimestamp();
     
     return msg.edit({ content: null, embeds: [updateEmbed] });
